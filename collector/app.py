@@ -286,15 +286,20 @@ def buscar_api():
 
     inicio = time.time()
 
-    logger.info(
-        "Consultando API de combustíveis..."
-    )
+    logger.info("Consultando API de combustíveis...")
 
 
     try:
 
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": "Mozilla/5.0"
+        }
+
+
         response = requests.get(
             API_URL,
+            headers=headers,
             timeout=20
         )
 
@@ -304,11 +309,15 @@ def buscar_api():
         )
 
 
+        logger.info(
+            f"Resposta: {response.text[:200]}"
+        )
+
+
         response.raise_for_status()
 
 
         dados = response.json()
-
 
 
         if dados.get("error"):
@@ -324,11 +333,9 @@ def buscar_api():
         salvar_dados(dados)
 
 
-
         logger.info(
             "Processo finalizado"
         )
-
 
 
     except Exception:
@@ -336,30 +343,3 @@ def buscar_api():
         logger.exception(
             "Falha na requisição API"
         )
-
-
-
-
-
-# ==========================
-# LOOP
-# ==========================
-
-
-logger.info(
-    "🚀 Collector iniciado"
-)
-
-
-while True:
-
-
-    buscar_api()
-
-
-    logger.info(
-        "Dormindo 1 hora..."
-    )
-
-
-    time.sleep(3600)
