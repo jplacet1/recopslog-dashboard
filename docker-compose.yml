@@ -1,54 +1,25 @@
 services:
-
   postgres:
     image: postgres:16
     container_name: postgres_db
     restart: always
-
     environment:
       POSTGRES_USER: admin
       POSTGRES_PASSWORD: recopslog
       POSTGRES_DB: recopslog
-
     ports:
       - "5432:5432"
-
     volumes:
       - postgres_data:/var/lib/postgresql/data
-
 
   collector:
     build: ./collector
     container_name: combustivel_collector
     restart: always
-
     env_file:
       - ./collector/.env
-
     depends_on:
       - postgres
-
-  dashboard:
-    build: ./collector
-    container_name: combustivel_dashboard
-    restart: always
-
-    command:
-      - streamlit
-      - run
-      - streamlit.py
-      - --server.address=0.0.0.0
-      - --server.port=8501
-
-    env_file:
-      - ./collector/.env
-
-    ports:
-      - "8501:8501"
-
-    depends_on:
-      - postgres
-
 
 volumes:
   postgres_data:
