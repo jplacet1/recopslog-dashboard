@@ -16,6 +16,44 @@ APP_DIR = Path(__file__).resolve().parent
 DOTENV_PATH = APP_DIR / ".env"
 API_URL_DEFAULT = "https://combustivelapi.com.br/api/precos/"
 
+BRAZILIAN_STATES = [
+    "AC",
+    "AL",
+    "AP",
+    "AM",
+    "BA",
+    "CE",
+    "DF",
+    "ES",
+    "GO",
+    "MA",
+    "MT",
+    "MS",
+    "MG",
+    "PA",
+    "PB",
+    "PR",
+    "PE",
+    "PI",
+    "RJ",
+    "RN",
+    "RS",
+    "RO",
+    "RR",
+    "SC",
+    "SP",
+    "SE",
+    "TO",
+]
+
+REGIONS = {
+    "Norte": ["AC", "AP", "AM", "PA", "RO", "RR", "TO"],
+    "Nordeste": ["AL", "BA", "CE", "MA", "PB", "PE", "PI", "RN", "SE"],
+    "Centro-Oeste": ["DF", "GO", "MT", "MS"],
+    "Sudeste": ["ES", "MG", "RJ", "SP"],
+    "Sul": ["PR", "RS", "SC"],
+}
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -78,14 +116,6 @@ def load_settings() -> Settings:
     )
 
 
-def mask_secret(value: Optional[str]) -> str:
-    if not value:
-        return "-"
-    if len(value) <= 4:
-        return "*" * len(value)
-    return f"{value[:2]}{'*' * (len(value) - 4)}{value[-2:]}"
-
-
 def connect_db(settings: Settings):
     return psycopg2.connect(**settings.db_config())
 
@@ -128,344 +158,159 @@ def table_exists(settings: Settings, table_name: str) -> bool:
     return bool(result)
 
 
-def get_available_values(settings: Settings, column: str) -> list[str]:
+def find_gasoline_name(settings: Settings) -> Optional[str]:
     if not table_exists(settings, "precos_combustiveis"):
-        return []
-    sql = f"""
-        SELECT DISTINCT {column}
-        FROM precos_combustiveis
-        WHERE {column} IS NOT NULL
-        ORDER BY {column}
-    """
-    df = query_dataframe(settings, sql)
-    return df[column].astype(str).tolist() if not df.empty else []
+        return None
 
-
-def get_date_bounds(settings: Settings) -> tuple[Optional[pd.Timestamp], Optional[pd.Timestamp]]:
-    if not table_exists(settings, "coletas"):
-        return None, None
     df = query_dataframe(
         settings,
         """
-        SELECT MIN(data_coleta) AS min_date, MAX(data_coleta) AS max_date
-        FROM coletas
+        SELECT DISTINCT combustivel
+        FROM precos_combustiveis
+        WHERE combustivel IS NOT NULL
+        ORDER BY combustivel
         """,
     )
     if df.empty:
-        return None, None
-    return df.loc[0, "min_date"], df.loc[0, "max_date"]
+        return None
+
+    candidates = df["combustivel"].astype(str).tolist()
+    for candidate in candidates:
+        normalized = candidate.strip().lower()
+        if "gasolina" in normalized:
+            return candidate
+    return candidates[0]
 
 
-def get_summary(settings: Settings) -> pd.DataFrame:
-    if not table_exists(settings, "coletas"):
-        return pd.DataFrame()
-    return query_dataframe(
-        settings,
-        """
-        WITH coletas_cte AS (
-            SELECT
-                COUNT(*) AS total_coletas,
-                MAX(data_coleta) AS ultima_coleta,
-                AVG(tempo_execucao_segundos) AS media_execucao
-            FROM coletas
-        ),
-        precos_cte AS (
-            SELECT COUNT(*) AS total_precos
-            FROM precos_combustiveis
-        ),
-        analises_cte AS (
-            SELECT COUNT(*) AS total_analises
-            FROM analises
-        )
-        SELECT
-            coletas_cte.total_coletas,
-            coletas_cte.ultima_coleta,
-            ROUND(coletas_cte.media_execucao::numeric, 2) AS media_execucao,
-            precos_cte.total_precos,
-            analises_cte.total_analises
-        FROM coletas_cte, precos_cte, analises_cte
-        """,
-    )
-
-
-def get_last_analysis(settings: Settings) -> pd.DataFrame:
-    if not table_exists(settings, "analises"):
-        return pd.DataFrame()
-    return query_dataframe(
-        settings,
-        """
-        SELECT
-            c.data_coleta,
-            a.*
-        FROM analises a
-        JOIN coletas c ON c.id = a.coleta_id
-        ORDER BY c.data_coleta DESC
-        LIMIT 1
-        """,
-    )
-
-
-def get_columns(settings: Settings, table_name: str) -> pd.DataFrame:
-    if not table_exists(settings, table_name):
-        return pd.DataFrame()
-    return query_dataframe(
-        settings,
-        """
-        SELECT
-            column_name,
-            data_type,
-            is_nullable,
-            ordinal_position
-        FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name = %s
-        ORDER BY ordinal_position
-        """,
-        (table_name,),
-    )
-
-
-def get_latest_prices(settings: Settings, fuel: str) -> pd.DataFrame:
+def get_available_states(settings: Settings, fuel: str) -> list[str]:
     if not table_exists(settings, "precos_combustiveis"):
-        return pd.DataFrame()
-    return query_dataframe(
+        return []
+    df = query_dataframe(
         settings,
         """
-        WITH latest AS (
-            SELECT MAX(data_coleta) AS data_coleta
-            FROM coletas
-        )
-        SELECT
-            c.data_coleta,
-            p.combustivel,
-            p.estado,
-            p.preco
-        FROM precos_combustiveis p
-        JOIN coletas c ON c.id = p.coleta_id
-        JOIN latest l ON l.data_coleta = c.data_coleta
-        WHERE p.combustivel = %s
-        ORDER BY p.estado
+        SELECT DISTINCT estado
+        FROM precos_combustiveis
+        WHERE combustivel = %s
+          AND estado IS NOT NULL
+        ORDER BY estado
         """,
         (fuel,),
     )
+    if df.empty:
+        return []
+    return df["estado"].astype(str).tolist()
 
 
 def get_price_history(
     settings: Settings,
     fuel: str,
     states: Sequence[str],
-    start_date: Optional[pd.Timestamp],
-    end_date: Optional[pd.Timestamp],
 ) -> pd.DataFrame:
     if not table_exists(settings, "precos_combustiveis"):
         return pd.DataFrame()
 
-    state_filter = tuple(states) if states else None
     sql = """
         SELECT
-            c.data_coleta,
-            p.combustivel,
+            DATE_TRUNC('day', c.data_coleta)::date AS data_dia,
             p.estado,
-            p.preco
+            AVG(p.preco::numeric) AS preco_medio
         FROM precos_combustiveis p
         JOIN coletas c ON c.id = p.coleta_id
         WHERE p.combustivel = %s
     """
     params: list[Any] = [fuel]
 
-    if start_date is not None:
-        sql += " AND c.data_coleta >= %s"
-        params.append(start_date)
-    if end_date is not None:
-        sql += " AND c.data_coleta < %s"
-        params.append(end_date + pd.Timedelta(days=1))
-    if state_filter:
+    if states:
         sql += " AND p.estado = ANY(%s)"
-        params.append(list(state_filter))
+        params.append(list(states))
 
-    sql += " ORDER BY c.data_coleta, p.estado"
+    sql += """
+        GROUP BY 1, 2
+        ORDER BY 1, 2
+    """
+
     df = query_dataframe(settings, sql, tuple(params))
     if not df.empty:
-        df["data_coleta"] = pd.to_datetime(df["data_coleta"])
-        df["preco"] = pd.to_numeric(df["preco"], errors="coerce")
+        df["data_dia"] = pd.to_datetime(df["data_dia"])
+        df["preco_medio"] = pd.to_numeric(df["preco_medio"], errors="coerce")
     return df
 
 
-def get_recent_collections(settings: Settings, limit: int = 20) -> pd.DataFrame:
-    if not table_exists(settings, "coletas"):
-        return pd.DataFrame()
-    return query_dataframe(
-        settings,
-        """
-        SELECT
-            id,
-            data_coleta,
-            fonte,
-            moeda,
-            tempo_execucao_segundos
-        FROM coletas
-        ORDER BY data_coleta DESC
-        LIMIT %s
-        """,
-        (limit,),
-    )
-
-
-def render_env_summary(settings: Settings) -> None:
-    expected = [
-        ("API_URL", settings.api_url, "opcional"),
-        ("DATABASE_HOST", settings.db_host, "obrigatorio"),
-        ("DATABASE_PORT", str(settings.db_port), "obrigatorio"),
-        ("DATABASE_NAME", settings.db_name, "obrigatorio"),
-        ("DATABASE_USER", settings.db_user, "obrigatorio"),
-        ("DATABASE_PASSWORD", mask_secret(settings.db_password), "obrigatorio"),
-        ("DATABASE_CONNECT_TIMEOUT", str(settings.db_connect_timeout), "default 10"),
-        ("COLLECTOR_INTERVAL_SECONDS", str(settings.interval_seconds), "default 3600"),
-        ("API_REQUEST_TIMEOUT_SECONDS", str(settings.request_timeout_seconds), "default 20"),
-        ("STARTUP_RETRY_ATTEMPTS", str(settings.startup_retry_attempts), "default 30"),
-        ("STARTUP_RETRY_DELAY_SECONDS", str(settings.startup_retry_delay_seconds), "default 5"),
-    ]
-    st.write("Valores usados pela interface e pelo collector:")
-    st.dataframe(
-        pd.DataFrame(expected, columns=["variavel", "valor", "observacao"]),
-        use_container_width=True,
-        hide_index=True,
-    )
-
-
-def render_schema_tab(settings: Settings) -> None:
-    tables = ["coletas", "precos_combustiveis", "analises"]
-    for table_name in tables:
-        st.subheader(table_name)
-        df = get_columns(settings, table_name)
-        if df.empty:
-            st.info("Tabela nao encontrada ou ainda sem metadados visiveis.")
-            continue
-        st.dataframe(
-            df.rename(
-                columns={
-                    "column_name": "coluna",
-                    "data_type": "tipo",
-                    "is_nullable": "nulo?",
-                    "ordinal_position": "ordem",
-                }
-            )[["ordem", "coluna", "tipo", "nulo?"]],
-            use_container_width=True,
-            hide_index=True,
-        )
-
-
-def render_summary_tab(settings: Settings) -> None:
-    summary = get_summary(settings)
-    latest_analysis = get_last_analysis(settings)
-    recent_collections = get_recent_collections(settings, 10)
-
-    if summary.empty:
-        st.warning("Nao encontrei dados nas tabelas ainda. Assim que o collector rodar, o painel aparece aqui.")
+def apply_region_preset(region_name: str, available_states: list[str]) -> None:
+    if region_name == "Todos":
+        st.session_state.state_picker = available_states
+        st.session_state.region_selected = "Todos"
         return
 
-    row = summary.iloc[0]
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Coletas", int(row["total_coletas"]))
-    c2.metric("Precos", int(row["total_precos"]))
-    c3.metric("Analises", int(row["total_analises"]))
-    c4.metric("Media execucao", f'{float(row["media_execucao"]):.2f}s' if pd.notna(row["media_execucao"]) else "-")
-
-    st.caption(
-        f"Ultima coleta: {pd.to_datetime(row['ultima_coleta']).strftime('%d/%m/%Y %H:%M:%S') if pd.notna(row['ultima_coleta']) else '-'}"
-    )
-
-    left, right = st.columns([1.1, 0.9])
-    with left:
-        st.subheader("Ultima analise")
-        if latest_analysis.empty:
-            st.info("Sem linhas na tabela analises.")
-        else:
-            analysis_view = latest_analysis.drop(columns=["coleta_id"], errors="ignore").copy()
-            st.dataframe(analysis_view, use_container_width=True, hide_index=True)
-
-    with right:
-        st.subheader("Ultimas coletas")
-        if recent_collections.empty:
-            st.info("Sem linhas na tabela coletas.")
-        else:
-            st.dataframe(recent_collections, use_container_width=True, hide_index=True)
+    region_states = REGIONS.get(region_name, [])
+    selected = [state for state in region_states if state in available_states]
+    st.session_state.state_picker = selected
+    st.session_state.region_selected = region_name
 
 
-def render_prices_tab(settings: Settings) -> None:
-    fuels = get_available_values(settings, "combustivel")
-    states = get_available_values(settings, "estado")
-    min_date, max_date = get_date_bounds(settings)
+def render_region_buttons(available_states: list[str]) -> None:
+    st.caption("Regioes")
+    buttons = st.columns(6)
+    region_names = ["Todos", "Norte", "Nordeste", "Centro-Oeste", "Sudeste", "Sul"]
 
-    if not fuels or min_date is None or max_date is None:
-        st.warning("Ainda nao ha dados suficientes para montar o grafico de precos.")
+    for index, region_name in enumerate(region_names):
+        with buttons[index]:
+            pressed = st.button(region_name, use_container_width=True, key=f"region_{region_name}")
+            if pressed:
+                apply_region_preset(region_name, available_states)
+
+
+def render_chart(settings: Settings, fuel: str) -> None:
+    available_states = get_available_states(settings, fuel)
+    if not available_states:
+        st.warning("Nao encontrei estados para montar o grafico.")
         return
 
-    col1, col2, col3 = st.columns([1.4, 1.2, 1.2])
-    with col1:
-        fuel = st.selectbox("Combustivel", fuels, index=0)
-    with col2:
-        default_states = states[:5] if len(states) > 5 else states
-        selected_states = st.multiselect("Estados", states, default=default_states)
-    with col3:
-        date_range = st.date_input(
-            "Periodo",
-            value=(pd.to_datetime(min_date).date(), pd.to_datetime(max_date).date()),
-            min_value=pd.to_datetime(min_date).date(),
-            max_value=pd.to_datetime(max_date).date(),
-        )
+    if "region_selected" not in st.session_state:
+        st.session_state.region_selected = "PE"
+    if "state_picker" not in st.session_state:
+        st.session_state.state_picker = ["PE"] if "PE" in available_states else available_states[:1]
 
-    start_date: Optional[pd.Timestamp] = None
-    end_date: Optional[pd.Timestamp] = None
-    if isinstance(date_range, tuple) and len(date_range) == 2:
-        start_date = pd.Timestamp(date_range[0])
-        end_date = pd.Timestamp(date_range[1])
+    render_region_buttons(available_states)
 
-    history = get_price_history(settings, fuel, selected_states, start_date, end_date)
+    if st.session_state.region_selected == "PE":
+        st.session_state.state_picker = ["PE"] if "PE" in available_states else available_states[:1]
 
+    selected_states = st.multiselect(
+        "Estados",
+        options=available_states,
+        default=st.session_state.state_picker,
+        key="state_picker",
+    )
+    st.session_state.state_picker = selected_states
+
+    history = get_price_history(settings, fuel, selected_states)
     if history.empty:
-        st.info("Nenhum preco encontrado com os filtros selecionados.")
+        st.info("Nenhum dado encontrado para os filtros atuais.")
         return
 
-    history["data_coleta"] = pd.to_datetime(history["data_coleta"])
-    history = history.sort_values(["estado", "data_coleta"])
+    fig = px.line(
+        history,
+        x="data_dia",
+        y="preco_medio",
+        color="estado",
+        markers=True,
+        title="Gasolina por estado ao longo do tempo",
+        labels={
+            "data_dia": "Dia",
+            "preco_medio": "Preco medio",
+            "estado": "Estado",
+        },
+    )
+    fig.update_layout(
+        height=620,
+        legend_title_text="Estado",
+        xaxis_title="Dia",
+        yaxis_title="Preco medio",
+    )
 
-    left, right = st.columns([1.25, 0.75])
-    with left:
-        fig = px.line(
-            history,
-            x="data_coleta",
-            y="preco",
-            color="estado",
-            markers=True,
-            title=f"Evolucao de precos - {fuel}",
-            labels={
-                "data_coleta": "Data da coleta",
-                "preco": "Preco",
-                "estado": "Estado",
-            },
-        )
-        fig.update_layout(legend_title_text="Estado", height=560)
-        st.plotly_chart(fig, use_container_width=True)
-
-    with right:
-        st.subheader("Resumo do filtro")
-        summary = (
-            history.groupby("estado", as_index=False)
-            .agg(minimo=("preco", "min"), maximo=("preco", "max"), media=("preco", "mean"))
-            .sort_values("media", ascending=False)
-        )
-        st.dataframe(summary, use_container_width=True, hide_index=True)
-
-    st.subheader("Dados do grafico")
+    st.plotly_chart(fig, use_container_width=True)
     st.dataframe(history, use_container_width=True, hide_index=True)
-
-    st.subheader("Precos na ultima coleta")
-    latest = get_latest_prices(settings, fuel)
-    if latest.empty:
-        st.info("Sem dados para a ultima coleta.")
-    else:
-        st.dataframe(latest, use_container_width=True, hide_index=True)
 
 
 def build_layout(settings: Settings) -> None:
@@ -473,49 +318,28 @@ def build_layout(settings: Settings) -> None:
         """
         <style>
         .block-container {
-            padding-top: 1.4rem;
-            padding-bottom: 2rem;
-        }
-        .stMetric {
-            border: 1px solid rgba(49, 51, 63, 0.15);
-            border-radius: 14px;
-            padding: 0.6rem 0.75rem;
-            background: rgba(255, 255, 255, 0.65);
+            padding-top: 1.2rem;
+            padding-bottom: 1.8rem;
         }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
-    st.title("Monitor de Precos do Collector")
-    st.caption("Painel para acompanhar coletas, precos por estado e o historico salvo no Postgres.")
+    st.title("Monitor de preco da gasolina")
+    st.caption("Grafico diario por estado com presets de regiao.")
 
-    with st.sidebar:
-        st.header("Conexao")
-        st.write(f"Host: `{settings.db_host}`")
-        st.write(f"Banco: `{settings.db_name}`")
-        st.write(f"Usuario: `{settings.db_user}`")
-        st.write(f"Porta: `{settings.db_port}`")
-        st.write(f"API: `{settings.api_url}`")
-        st.divider()
-        if st.button("Recarregar dados"):
-            st.cache_data.clear()
-            st.rerun()
-        st.divider()
-        render_env_summary(settings)
+    fuel_name = find_gasoline_name(settings)
+    if not fuel_name:
+        st.warning("Ainda nao consegui identificar a gasolina na base.")
+        return
 
-    tabs = st.tabs(["Resumo", "Precos", "Schema"])
-    with tabs[0]:
-        render_summary_tab(settings)
-    with tabs[1]:
-        render_prices_tab(settings)
-    with tabs[2]:
-        render_schema_tab(settings)
+    render_chart(settings, fuel_name)
 
 
 def main() -> None:
     st.set_page_config(
-        page_title="RecOpsLog | Monitor de Precos",
+        page_title="Fuel Price Monitor",
         page_icon="P",
         layout="wide",
     )
@@ -525,6 +349,11 @@ def main() -> None:
     except Exception as exc:
         st.error(f"Configuracao invalida: {exc}")
         st.stop()
+
+    with st.sidebar:
+        if st.button("Recarregar dados"):
+            st.cache_data.clear()
+            st.rerun()
 
     try:
         build_layout(settings)
