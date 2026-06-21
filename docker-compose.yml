@@ -5,16 +5,16 @@ services:
     restart: always
     environment:
       POSTGRES_USER: admin
-      POSTGRES_PASSWORD: recopslog
+      POSTGRES_PASSWORD: 78sIubuyFZs98ymYqHWUCPUbuMhOdR
       POSTGRES_DB: recopslog
     ports:
-      - "5432:5432"
+      - "5432:5433"
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
   collector:
     build: ./collector
-    container_name: combustivel_collector
+    container_name: collector_worker
     restart: always
     env_file:
       - ./collector/.env
